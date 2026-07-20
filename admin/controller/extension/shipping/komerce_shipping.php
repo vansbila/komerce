@@ -277,7 +277,7 @@ class ControllerExtensionShippingKomerceShipping extends Controller {
 
         // Inject default values from builder settings if empty in DB
         if (empty($data['komerce_shipping_apikey'])) {
-            $data['komerce_shipping_apikey'] = 'sNMFcxAQcd0036ae75d0c302FdO0zoLX';
+            $data['komerce_shipping_apikey'] = 'your api key ';
         }
         if (empty($data['komerce_shipping_api_tier'])) {
             $data['komerce_shipping_api_tier'] = 'pro';

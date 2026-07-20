@@ -480,7 +480,7 @@ class ControllerExtensionShippingKomerceShipping extends Controller {
             $apikey = $this->config->get('komerce_apikey');
         }
         if (empty($apikey)) {
-            $apikey = 'sNMFcxAQcd0036ae75d0c302FdO0zoLX';
+            $apikey = 'your api key';
         }
         $client_id = $this->config->get('komerce_client_id');
         if (empty($client_id)) {

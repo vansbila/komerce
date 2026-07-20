@@ -1,8 +1,7 @@
 <?php
 /**
- * @package     Komerce Shipping Method Model with RajaOngkir integration (V2 OpenAPI)
- * @author      Zoraya Developer Team
- * @description Highly optimized database caching & synchronization to reduce API overhead and accelerate checkout.
+ * @package     Komerce Shipping Model - RajaOngkir API v1 Compatibility
+ * @author      Integration Team
  */
 class ModelExtensionShippingKomerceShipping extends Model {
     public function getQuote($address) {
@@ -10,222 +9,181 @@ class ModelExtensionShippingKomerceShipping extends Model {
 
         $quote_data = array();
 
-        // Check if module active
+        // 1. Cek Status Modul
         if (!$this->config->get('komerce_shipping_status')) {
             return array();
         }
 
-        // Get shipping weight from cart
+        // 2. Hitung Berat (Gram)
         $weight = $this->cart->getWeight();
         if ($weight <= 0) {
             $weight = (float)$this->config->get('komerce_shipping_default_weight');
         }
-        if ($weight <= 0) {
-            $weight = 1000; // Default to 1kg if still 0
-        }
+        $weight_g = (int)round($weight);
+        if ($weight_g <= 0) $weight_g = 1000;
 
-        // Target Subdistrict ID (Customer address code via Custom Fields or standard address matching)
-        $destination_subdistrict_id = '';
-        
-        if (isset($address['subdistrict_id']) && !empty($address['subdistrict_id'])) {
-            $destination_subdistrict_id = $address['subdistrict_id'];
-        } elseif (isset($address['custom_field'][$this->config->get('komerce_shipping_subdistrict_field_id')]) && !empty($address['custom_field'][$this->config->get('komerce_shipping_subdistrict_field_id')])) {
-            $destination_subdistrict_id = $address['custom_field'][$this->config->get('komerce_shipping_subdistrict_field_id')];
-        }
+        // 3. Tentukan Destinasi Berdasarkan Tier (Starter/Basic = city, Pro = subdistrict)
+        $tier = $this->config->get('komerce_shipping_api_tier');
+        if (!$tier) $tier = 'starter';
 
-        // Extremely robust text-matching fallback if subdistrict ID is empty or not numeric
-        if (empty($destination_subdistrict_id) || !is_numeric($destination_subdistrict_id)) {
-            $search_term = '';
-            if (isset($address['address_1'])) {
-                $search_term .= ' ' . $address['address_1'];
-            }
-            if (isset($address['address_2'])) {
-                $search_term .= ' ' . $address['address_2'];
-            }
-            if (isset($address['city'])) {
-                $search_term .= ' ' . $address['city'];
-            }
+        $destination_id = 0;
+        $destination_type = ($tier == 'pro') ? 'subdistrict' : 'city';
 
-            // Search the local database table if it exists
-            $table_query = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_subdistrict'");
-            if ($table_query->num_rows && !empty(trim($search_term))) {
-                // Tokenize and clean search terms
-                $words = explode(' ', preg_replace('/[^a-zA-Z0-9 ]/', ' ', strtolower($search_term)));
-                $words = array_filter($words, function($w) { return strlen($w) > 3; });
-                
-                if (!empty($words)) {
-                    $like_clauses = array();
-                    foreach ($words as $w) {
-                        $like_clauses[] = "LOWER(subdistrict_name) LIKE '%" . $this->db->escape($w) . "%'";
-                    }
-                    $sub_search = $this->db->query("SELECT subdistrict_id FROM " . DB_PREFIX . "komerce_subdistrict WHERE " . implode(" OR ", $like_clauses) . " LIMIT 1");
-                    if ($sub_search->num_rows) {
-                        $destination_subdistrict_id = $sub_search->row['subdistrict_id'];
-                    }
-                }
+        if ($tier == 'pro') {
+            // Cek Subdistrict ID dari Custom Fields atau Address matching
+            if (isset($address['subdistrict_id'])) {
+                $destination_id = $address['subdistrict_id'];
+            }
+        } else {
+            // Cek City ID
+            if (isset($address['city_id'])) {
+                $destination_id = $address['city_id'];
             }
         }
 
-        // If STILL empty, match based on city name directly
-        if (empty($destination_subdistrict_id) || !is_numeric($destination_subdistrict_id)) {
-            if (isset($address['city']) && !empty($address['city'])) {
-                $table_query = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_subdistrict'");
-                if ($table_query->num_rows) {
-                    $city_sub_search = $this->db->query("SELECT s.subdistrict_id FROM " . DB_PREFIX . "komerce_subdistrict s LEFT JOIN " . DB_PREFIX . "komerce_city c ON s.city_id = c.city_id WHERE LOWER(c.city_name) LIKE '%" . $this->db->escape(strtolower($address['city'])) . "%' LIMIT 1");
-                    if ($city_sub_search->num_rows) {
-                        $destination_subdistrict_id = $city_sub_search->row['subdistrict_id'];
-                    }
-                }
-            }
+        // Fallback: Jika ID tidak ditemukan, coba cari di DB Lokal berdasarkan nama
+        if (!$destination_id) {
+            $destination_id = $this->findLocationByName($address, $destination_type);
         }
 
-        // If still empty or not numeric, return empty array gracefully instead of throwing 400 or 500 errors
-        if (empty($destination_subdistrict_id) || !is_numeric($destination_subdistrict_id)) {
+        if (!$destination_id) {
             return array();
         }
 
-        // --- DATABASE SYNCHRONIZATION & CACHING ENGINE ---
-        $origin_id = $this->config->get('komerce_shipping_subdistrict_id');
-        if (empty($origin_id)) {
-            $origin_id = '40101'; // Default fallback to Danurejan, Yogyakarta to prevent API failure
-        }
-        $weight_g = (int)round($weight);
+        // 4. Setup Origin
+        $origin_id = ($tier == 'pro') ? $this->config->get('komerce_shipping_subdistrict_id') : $this->config->get('komerce_shipping_city_id');
+        $origin_type = ($tier == 'pro') ? 'subdistrict' : 'city';
 
+        if (!$origin_id) $origin_id = '401'; // Default Yogyakarta City
+
+        // --- CACHING ENGINE ---
         $rates_list = null;
         $is_from_cache = false;
-        $table_exists = false;
+        
+        $cache_query = $this->db->query("SELECT * FROM " . DB_PREFIX . "komerce_shipping_cache 
+            WHERE origin = '" . $this->db->escape($origin_id) . "' 
+              AND destination = '" . $this->db->escape($destination_id) . "' 
+              AND weight = '" . (int)$weight_g . "' 
+              AND date_added > DATE_SUB(NOW(), INTERVAL 1 DAY) 
+            LIMIT 1");
 
-        // Check table existence first to avoid database error if tables aren't initialized yet
-        $table_query = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_shipping_cache'");
-        if ($table_query->num_rows) {
-            $table_exists = true;
-            
-            // Try retrieving valid, synchronized shipping rates from database cache first (expiry: 24 Hours / 1 Day)
-            $cache_query = $this->db->query("SELECT * FROM " . DB_PREFIX . "komerce_shipping_cache 
-                WHERE origin = '" . $this->db->escape($origin_id) . "' 
-                  AND destination = '" . $this->db->escape($destination_subdistrict_id) . "' 
-                  AND weight = '" . (int)$weight_g . "' 
-                  AND date_added > DATE_SUB(NOW(), INTERVAL 1 DAY) 
-                LIMIT 1");
-
-            if ($cache_query->num_rows) {
-                $rates_list = json_decode($cache_query->row['rates_json'], true);
-                $is_from_cache = true;
-            }
+        if ($cache_query->num_rows) {
+            $rates_list = json_decode($cache_query->row['rates_json'], true);
+            $is_from_cache = true;
         }
 
-        // If no cached/synced rates found, query the live Komerce Shipping API
+        // --- API CALL (Jika Cache Kosong) ---
         if (!$rates_list) {
-            // Setup Credentials
             $apikey = $this->config->get('komerce_shipping_apikey');
-            if (empty($apikey)) {
-                $apikey = $this->config->get('komerce_apikey');
-            }
-            if (empty($apikey)) {
-                $apikey = 'sNMFcxAQcd0036ae75d0c302FdO0zoLX';
-            }
-            $client_id = $this->config->get('komerce_client_id');
-            if (empty($client_id)) {
-                $client_id = 'CLIENT-ZORAYA-098';
-            }
-            $environment = $this->config->get('komerce_environment');
-            if (empty($environment)) {
-                $environment = 'production';
-            }
+            $api_url = "https://rajaongkir.komerce.id/api/v1/cost";
+
+            // Daftar kurir yang didukung
+            $couriers = ($tier == 'starter') ? array('jne', 'pos', 'tiki') : array('jne', 'pos', 'tiki', 'jnt', 'sicepat', 'wahana', 'lion');
             
-            $api_url = ($environment == 'sandbox') 
-                ? "https://sandbox-api.komerce.id/v2/shipping/rates" 
-                : "https://api.komerce.id/v2/shipping/rates";
+            $all_results = array();
 
-            $payload = array(
-                'origin'      => $origin_id,
-                'destination' => $destination_subdistrict_id,
-                'weight'      => $weight_g,
-                'couriers'    => 'jne,sicepat,jnt,pos,tiki'
-            );
+            foreach ($couriers as $courier) {
+                $post_data = array(
+                    'origin'          => $origin_id,
+                    'originType'      => $origin_type,
+                    'destination'     => $destination_id,
+                    'destinationType' => $destination_type,
+                    'weight'          => $weight_g,
+                    'courier'         => $courier
+                );
 
-            // Call Komerce Shipping API
-            $ch = curl_init($api_url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_POST, true);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
-            curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-                'Content-Type: application/json',
-                'X-Komerce-Client-Id: ' . $client_id,
-                'Authorization: Bearer ' . $apikey
-            ));
+                $ch = curl_init();
+                curl_setopt($ch, CURLOPT_URL, $api_url);
+                curl_setopt($ch, CURLOPT_POST, true);
+                curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($post_data));
+                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                    "key: " . $apikey,
+                    "content-type: application/x-www-form-urlencoded"
+                ));
+                $response = curl_exec($ch);
+                curl_close($ch);
 
-            $response = curl_exec($ch);
-            $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
+                $result = json_decode($response, true);
 
-            $result = json_decode($response, true);
+                if (isset($result['rajaongkir']['results'][0]['costs'])) {
+                    $courier_name = $result['rajaongkir']['results'][0]['name'];
+                    $courier_code = $result['rajaongkir']['results'][0]['code'];
 
-            if ($http_code === 200 && isset($result['data'])) {
-                $rates_list = $result['data'];
-                
-                // Synchronize/Save newly fetched rates into database cache
-                if ($table_exists) {
-                    $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_shipping_cache 
-                        SET origin = '" . $this->db->escape($origin_id) . "', 
-                            destination = '" . $this->db->escape($destination_subdistrict_id) . "', 
-                            weight = '" . (int)$weight_g . "', 
-                            rates_json = '" . $this->db->escape(json_encode($rates_list)) . "', 
-                            date_added = NOW()");
+                    foreach ($result['rajaongkir']['results'][0]['costs'] as $cost_detail) {
+                        $all_results[] = array(
+                            'code'    => strtolower($courier_code),
+                            'name'    => $courier_name,
+                            'service' => $cost_detail['service'],
+                            'cost'    => $cost_detail['cost'][0]['value'],
+                            'etd'     => $cost_detail['cost'][0]['etd']
+                        );
+                    }
                 }
+            }
+
+            if (!empty($all_results)) {
+                $rates_list = $all_results;
+                // Simpan ke Cache
+                $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_shipping_cache 
+                    SET origin = '" . $this->db->escape($origin_id) . "', 
+                        destination = '" . $this->db->escape($destination_id) . "', 
+                        weight = '" . (int)$weight_g . "', 
+                        rates_json = '" . $this->db->escape(json_encode($rates_list)) . "', 
+                        date_added = NOW()");
             }
         }
 
-        // Parse rates list and build the OpenCart Quote array
+        // --- BUILD QUOTE DATA ---
         if (!empty($rates_list)) {
-            $store_currency = $this->config->get('config_currency');
-            $session_currency = isset($this->session->data['currency']) ? $this->session->data['currency'] : $store_currency;
-
             foreach ($rates_list as $rate) {
-                $carrier_code = isset($rate['courier_code']) ? strtolower($rate['courier_code']) : (isset($rate['courier']) ? strtolower($rate['courier']) : 'courier');
-                $service_code = isset($rate['service']) ? strtolower($rate['service']) : 'reg';
-                $service_name = isset($rate['service_name']) ? $rate['service_name'] : (isset($rate['service']) ? $rate['service'] : 'REG');
-                $etd = isset($rate['etd']) ? $rate['etd'] : '2-3';
-                $cost = isset($rate['cost']) ? (float)$rate['cost'] : 0.0;
+                $carrier_code = $rate['code'];
+                $service_code = str_replace(' ', '_', strtolower($rate['service']));
                 
-                $title = strtoupper($carrier_code) . ' (' . $service_name . ') - ' . $etd . ' Hari';
-                if ($is_from_cache) {
-                    $title .= ' [Database Synced]';
-                }
-                
-                // Safe currency conversion to prevent Division by Zero or missing currency errors
-                if ($store_currency != 'IDR') {
-                    if (method_exists($this->currency, 'convert')) {
-                        // Check if IDR exists in currency table to prevent math errors
-                        $curr_query = $this->db->query("SELECT * FROM " . DB_PREFIX . "currency WHERE code = 'IDR' AND status = '1'");
-                        if ($curr_query->num_rows) {
-                            $cost = $this->currency->convert($cost, 'IDR', $store_currency);
-                        }
-                    }
+                $title = $rate['name'] . ' - ' . $rate['service'];
+                if ($rate['etd']) $title .= ' (' . $rate['etd'] . ' Hari)';
+
+                $cost = (float)$rate['cost'];
+
+                // Konversi Mata Uang jika bukan IDR
+                if ($this->config->get('config_currency') != 'IDR') {
+                    $cost = $this->currency->convert($cost, 'IDR', $this->config->get('config_currency'));
                 }
 
                 $quote_data[$carrier_code . '_' . $service_code] = array(
                     'code'         => 'komerce_shipping.' . $carrier_code . '_' . $service_code,
                     'title'        => $title,
-                    'cost'         => $cost,
+                    'cost'         => $this->tax->calculate($cost, 0, $this->config->get('config_tax')),
                     'tax_class_id' => 0,
-                    'text'         => $this->currency->format($cost, $session_currency)
+                    'text'         => $this->currency->format($this->tax->calculate($cost, 0, $this->config->get('config_tax')), $this->session->data['currency'])
                 );
             }
         }
 
-        if (empty($quote_data)) {
-            return array();
-        }
+        if (!$quote_data) return array();
 
-        $method_data = array(
+        return array(
             'code'       => 'komerce_shipping',
-            'title'      => 'Komerce Integrasi RajaOngkir' . ($is_from_cache ? ' (Cached)' : ''),
+            'title'      => 'Komerce Integrasi RajaOngkir',
             'quote'      => $quote_data,
             'sort_order' => $this->config->get('komerce_shipping_sort_order'),
             'error'      => false
         );
+    }
 
-        return $method_data;
+    /**
+     * Helper: Cari ID Lokasi berdasarkan Nama Kota (Fallback jika ID kosong)
+     */
+    private function findLocationByName($address, $type) {
+        $table = ($type == 'subdistrict') ? DB_PREFIX . 'komerce_subdistrict' : DB_PREFIX . 'komerce_city';
+        $col_name = ($type == 'subdistrict') ? 'subdistrict_name' : 'city_name';
+        $col_id = ($type == 'subdistrict') ? 'subdistrict_id' : 'city_id';
+
+        $search = isset($address['city']) ? $address['city'] : '';
+        if (!$search) return 0;
+
+        $query = $this->db->query("SELECT $col_id FROM $table WHERE LOWER($col_name) LIKE '%" . $this->db->escape(strtolower($search)) . "%' LIMIT 1");
+        
+        return ($query->num_rows) ? $query->row[$col_id] : 0;
     }
 }

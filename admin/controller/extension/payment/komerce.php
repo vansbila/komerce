@@ -1,6 +1,6 @@
 <?php
 /**
- * @package     Komerce Payment Gateway for OpenCart 2.3.x
+ * @package     Komerce Payment Gateway (Powered by RajaOngkir API) for OpenCart 2.3.x
  * @author      Developer Zoraya & Komerce Integration
  * @license     MIT
  */
@@ -8,43 +8,43 @@ class ControllerExtensionPaymentKomerce extends Controller {
     private $error = array();
 
     public function index() {
+        // Load bahasa
         $this->load->language('extension/payment/komerce');
         $this->document->setTitle($this->language->get('heading_title'));
         $this->load->model('setting/setting');
 
+        // Simpan konfigurasi jika ada request POST
         if (($this->request->server['REQUEST_METHOD'] == 'POST') && $this->validate()) {
             $this->model_setting_setting->editSetting('komerce', $this->request->post);
             $this->session->data['success'] = $this->language->get('text_success');
             $this->response->redirect($this->url->link('extension/extension', 'token=' . $this->session->data['token'] . '&type=payment', true));
         }
 
-        // Language variables mapping
+        // Mapping variabel bahasa ke View
         $data['heading_title'] = $this->language->get('heading_title');
         $data['text_edit'] = $this->language->get('text_edit');
         $data['text_enabled'] = $this->language->get('text_enabled');
         $data['text_disabled'] = $this->language->get('text_disabled');
-        $data['text_sandbox'] = $this->language->get('text_sandbox');
-        $data['text_production'] = $this->language->get('text_production');
         
-        $data['entry_apikey'] = $this->language->get('entry_apikey');
-        $data['entry_client_id'] = $this->language->get('entry_client_id');
-        $data['entry_client_secret'] = $this->language->get('entry_client_secret');
-        $data['entry_environment'] = $this->language->get('entry_environment');
+        // RajaOngkir Account Types
+        $data['text_starter'] = 'Starter';
+        $data['text_basic'] = 'Basic';
+        $data['text_pro'] = 'Pro';
+
+        $data['entry_apikey'] = $this->language->get('entry_apikey'); // Diisi API Key RajaOngkir
+        $data['entry_account_type'] = $this->language->get('entry_account_type'); // starter/basic/pro
         $data['entry_status'] = $this->language->get('entry_status');
         $data['entry_sort_order'] = $this->language->get('entry_sort_order');
-        $data['entry_webhook_token'] = $this->language->get('entry_webhook_token');
-        $data['entry_webhook_url'] = $this->language->get('entry_webhook_url');
-
-        // Status Map
-        $data['entry_status_pending'] = $this->language->get('entry_status_pending');
-        $data['entry_status_paid'] = $this->language->get('entry_status_paid');
-        $data['entry_status_shipped'] = $this->language->get('entry_status_shipped');
-        $data['entry_status_cancelled'] = $this->language->get('entry_status_cancelled');
+        
+        // Status Mapping (Sesuai dokumentasi RajaOngkir Payment)
+        $data['entry_order_status'] = $this->language->get('entry_order_status'); // Status awal saat checkout
+        $data['entry_order_success_status'] = $this->language->get('entry_order_success_status'); // Saat 'settlement'
+        $data['entry_order_failed_status'] = $this->language->get('entry_order_failed_status'); // Saat 'expire/cancel'
 
         $data['button_save'] = $this->language->get('button_save');
         $data['button_cancel'] = $this->language->get('button_cancel');
 
-        // Error alerts
+        // Alert Error
         if (isset($this->error['warning'])) {
             $data['error_warning'] = $this->error['warning'];
         } else {
@@ -74,24 +74,15 @@ class ControllerExtensionPaymentKomerce extends Controller {
         $data['action'] = $this->url->link('extension/payment/komerce', 'token=' . $this->session->data['token'], true);
         $data['cancel'] = $this->url->link('extension/extension', 'token=' . $this->session->data['token'] . '&type=payment', true);
 
-        // Populate configuration data
+        // Daftar kunci konfigurasi untuk looping
         $config_keys = array(
             'komerce_status',
             'komerce_apikey',
-            'komerce_client_id',
-            'komerce_client_secret',
-            'komerce_environment',
-            'komerce_webhook_token',
-            'komerce_status_pending_id',
-            'komerce_status_paid_id',
-            'komerce_status_shipped_id',
-            'komerce_status_cancelled_id',
-            'komerce_sort_order',
-            'komerce_qris_status',
-            'komerce_bca_va_status',
-            'komerce_mandiri_va_status',
-            'komerce_bni_va_status',
-            'komerce_bri_va_status'
+            'komerce_account_type',
+            'komerce_order_status_id',
+            'komerce_order_success_status_id',
+            'komerce_order_failed_status_id',
+            'komerce_sort_order'
         );
 
         foreach ($config_keys as $key) {
@@ -102,19 +93,14 @@ class ControllerExtensionPaymentKomerce extends Controller {
             }
         }
 
-        // Inject default webhook token if empty
-        if (empty($data['komerce_webhook_token'])) {
-            $data['komerce_webhook_token'] = 'KMCSIGN_ZORAYA_7781';
-        }
+        // URL Webhook untuk didaftarkan di Dashboard RajaOngkir
+        $data['webhook_url'] = HTTP_CATALOG . 'index.php?route=extension/payment/komerce/callback';
 
-        // Webhook URL endpoint for Komerce
-        $data['webhook_url'] = HTTP_CATALOG . 'index.php?route=extension/payment/komerce/webhook';
-
-        // Load all order statuses from database
+        // Load semua status pesanan untuk dropdown
         $this->load->model('localisation/order_status');
         $data['order_statuses'] = $this->model_localisation_order_status->getOrderStatuses();
 
-        // Template components loading
+        // Template components
         $data['header'] = $this->load->controller('common/header');
         $data['column_left'] = $this->load->controller('common/column_left');
         $data['footer'] = $this->load->controller('common/footer');
@@ -126,9 +112,12 @@ class ControllerExtensionPaymentKomerce extends Controller {
         if (!$this->user->hasPermission('modify', 'extension/payment/komerce')) {
             $this->error['warning'] = $this->language->get('error_permission');
         }
+        
+        // API Key RajaOngkir wajib diisi
         if (!$this->request->post['komerce_apikey']) {
             $this->error['apikey'] = $this->language->get('error_apikey');
         }
+
         return !$this->error;
     }
 }

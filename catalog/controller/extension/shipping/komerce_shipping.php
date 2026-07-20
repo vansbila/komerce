@@ -1,372 +1,192 @@
 <?php
 class ControllerExtensionShippingKomerceShipping extends Controller {
-    // 1. Get provinces dynamic list (used by checkout dropdowns)
-    public function get_provinces_ajax() {
-        $this->response->addHeader('Content-Type: application/json');
-        
-        $table_check = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_province'");
-        if (!$table_check->num_rows) {
-            $this->response->setOutput(json_encode(array()));
-            return;
-        }
-        
-        $prov_query = $this->db->query("SELECT province_id, province_name FROM " . DB_PREFIX . "komerce_province ORDER BY province_name ASC");
-        
-        // If empty, sync first from API (JIT sync)
-        if (!$prov_query->num_rows) {
-            $this->sync_regional_tables_jit('provinces');
-            $prov_query = $this->db->query("SELECT province_id, province_name FROM " . DB_PREFIX . "komerce_province ORDER BY province_name ASC");
-        }
-        
-        $this->response->setOutput(json_encode($prov_query->rows));
+    private $error = array();
+
+    public function install() {
+        $this->db->query("CREATE TABLE IF NOT EXISTS " . DB_PREFIX . "komerce_province (
+            province_id INT NOT NULL,
+            province_name VARCHAR(100) NOT NULL,
+            PRIMARY KEY (province_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8;");
+
+        $this->db->query("CREATE TABLE IF NOT EXISTS " . DB_PREFIX . "komerce_city (
+            city_id INT NOT NULL,
+            province_id INT NOT NULL,
+            city_name VARCHAR(100) NOT NULL,
+            type VARCHAR(50) NOT NULL,
+            postal_code VARCHAR(10) NOT NULL,
+            PRIMARY KEY (city_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8;");
+
+        $this->db->query("CREATE TABLE IF NOT EXISTS " . DB_PREFIX . "komerce_subdistrict (
+            subdistrict_id INT NOT NULL,
+            city_id INT NOT NULL,
+            subdistrict_name VARCHAR(100) NOT NULL,
+            PRIMARY KEY (subdistrict_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8;");
     }
 
-    // 2. Get cities dynamic list by Province ID
+    public function index() {
+        $this->load->language('extension/shipping/komerce_shipping');
+        $this->document->setTitle("Komerce RajaOngkir Setup");
+        $this->load->model('setting/setting');
+
+        if (($this->request->server['REQUEST_METHOD'] == 'POST') && $this->validate()) {
+            $this->model_setting_setting->editSetting('komerce_shipping', $this->request->post);
+            $this->session->data['success'] = "Sukses: Konfigurasi telah disimpan!";
+            $this->response->redirect($this->url->link('extension/extension', 'token=' . $this->session->data['token'] . '&type=shipping', true));
+        }
+
+        $data['heading_title'] = "Komerce RajaOngkir (OC 2.3)";
+        $data['token'] = $this->session->data['token'];
+
+        $config_keys = array(
+            'komerce_shipping_status',
+            'komerce_shipping_apikey',
+            'komerce_shipping_api_tier',
+            'komerce_shipping_province_id',
+            'komerce_shipping_city_id',
+            'komerce_shipping_subdistrict_id',
+            'komerce_shipping_sort_order'
+        );
+
+        foreach ($config_keys as $key) {
+            $data[$key] = (isset($this->request->post[$key])) ? $this->request->post[$key] : $this->config->get($key);
+        }
+
+        // Ambil nama untuk tampilan dropdown yang sudah terpilih
+        $data['province_name'] = $this->get_name_by_id('province', $data['komerce_shipping_province_id']);
+        $data['city_name'] = $this->get_name_by_id('city', $data['komerce_shipping_city_id']);
+        $data['subdistrict_name'] = $this->get_name_by_id('subdistrict', $data['komerce_shipping_subdistrict_id']);
+
+        $data['error_warning'] = isset($this->error['warning']) ? $this->error['warning'] : '';
+        $data['action'] = $this->url->link('extension/shipping/komerce_shipping', 'token=' . $this->session->data['token'], true);
+        $data['cancel'] = $this->url->link('extension/extension', 'token=' . $this->session->data['token'] . '&type=shipping', true);
+
+        $data['breadcrumbs'] = array();
+        $data['breadcrumbs'][] = array('text' => 'Home', 'href' => $this->url->link('common/dashboard', 'token=' . $this->session->data['token'], true));
+        $data['breadcrumbs'][] = array('text' => 'Shipping', 'href' => $this->url->link('extension/extension', 'token=' . $this->session->data['token'] . '&type=shipping', true));
+        $data['breadcrumbs'][] = array('text' => $data['heading_title'], 'href' => $this->url->link('extension/shipping/komerce_shipping', 'token=' . $this->session->data['token'], true));
+
+        $data['header'] = $this->load->controller('common/header');
+        $data['column_left'] = $this->load->controller('common/column_left');
+        $data['footer'] = $this->load->controller('common/footer');
+
+        $this->response->setOutput($this->load->view('extension/shipping/komerce_shipping', $data));
+    }
+
+    // --- API HELPER ---
+    private function call_api($endpoint, $params = array()) {
+        $api_key = $this->config->get('komerce_shipping_apikey');
+        $url = "https://rajaongkir.komerce.id/api/v1/" . $endpoint;
+        if (!empty($params)) $url .= "?" . http_build_query($params);
+
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, TRUE);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+            "accept: application/json",
+            "key: " . $api_key
+        ));
+        curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+        $response = curl_exec($ch);
+        curl_close($ch);
+        return json_decode($response, true);
+    }
+
+    // --- AJAX DROPDOWN METHODS ---
+    public function get_provinces_ajax() {
+        $this->response->addHeader('Content-Type: application/json');
+        $query = $this->db->query("SELECT province_id, province_name FROM " . DB_PREFIX . "komerce_province ORDER BY province_name ASC");
+        if (!$query->num_rows) {
+            $this->sync_db(); // JIT sync jika kosong
+            $query = $this->db->query("SELECT province_id, province_name FROM " . DB_PREFIX . "komerce_province ORDER BY province_name ASC");
+        }
+        $this->response->setOutput(json_encode($query->rows));
+    }
+
     public function get_cities_ajax() {
         $this->response->addHeader('Content-Type: application/json');
         $province_id = isset($this->request->get['province_id']) ? (int)$this->request->get['province_id'] : 0;
-        
-        $table_check = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_city'");
-        if (!$table_check->num_rows) {
-            $this->response->setOutput(json_encode(array()));
-            return;
-        }
-        
-        // JIT check
-        $city_query = $this->db->query("SELECT city_id, city_name FROM " . DB_PREFIX . "komerce_city WHERE province_id = '" . (int)$province_id . "' ORDER BY city_name ASC");
-        if (!$city_query->num_rows && $province_id) {
-            $this->sync_regional_tables_jit('cities');
-            $city_query = $this->db->query("SELECT city_id, city_name FROM " . DB_PREFIX . "komerce_city WHERE province_id = '" . (int)$province_id . "' ORDER BY city_name ASC");
-        }
-        
-        $this->response->setOutput(json_encode($city_query->rows));
+        $query = $this->db->query("SELECT city_id, city_name, type FROM " . DB_PREFIX . "komerce_city WHERE province_id = '" . (int)$province_id . "' ORDER BY city_name ASC");
+        $this->response->setOutput(json_encode($query->rows));
     }
 
-    // 3. Search Province endpoint (aligns with RajaOngkir search_province)
-    public function search_province() {
+    public function get_subdistricts_ajax() {
         $this->response->addHeader('Content-Type: application/json');
-        $search = isset($this->request->get['search']) ? trim($this->request->get['search']) : (isset($this->request->get['q']) ? trim($this->request->get['q']) : '');
-        
-        $table_check = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_province'");
-        if (!$table_check->num_rows) {
-            $this->response->setOutput(json_encode(array('results' => array())));
-            return;
-        }
-        
-        $sql = "SELECT province_id as id, province_name as text FROM " . DB_PREFIX . "komerce_province";
-        if (!empty($search)) {
-            $sql .= " WHERE LOWER(province_name) LIKE '%" . $this->db->escape(strtolower($search)) . "%'";
-        }
-        $sql .= " ORDER BY province_name ASC LIMIT 30";
-        
-        $query = $this->db->query($sql);
-        
-        // JIT Sync if table is entirely empty
-        if (!$query->num_rows && empty($search)) {
-            $this->sync_regional_tables_jit('provinces');
-            $query = $this->db->query($sql);
-        }
-        
-        $this->response->setOutput(json_encode(array('results' => $query->rows)));
-    }
-
-    // 4. Search City endpoint (aligns with RajaOngkir search_city)
-    public function search_city() {
-        $this->response->addHeader('Content-Type: application/json');
-        $search = isset($this->request->get['search']) ? trim($this->request->get['search']) : (isset($this->request->get['q']) ? trim($this->request->get['q']) : '');
-        $province_id = isset($this->request->get['province_id']) ? (int)$this->request->get['province_id'] : 0;
-        
-        $table_check = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_city'");
-        if (!$table_check->num_rows) {
-            $this->response->setOutput(json_encode(array('results' => array())));
-            return;
-        }
-        
-        $sql = "SELECT city_id as id, city_name as text FROM " . DB_PREFIX . "komerce_city WHERE 1=1";
-        if ($province_id) {
-            $sql .= " AND province_id = '" . (int)$province_id . "'";
-        }
-        if (!empty($search)) {
-            $sql .= " AND LOWER(city_name) LIKE '%" . $this->db->escape(strtolower($search)) . "%'";
-        }
-        $sql .= " ORDER BY city_name ASC LIMIT 30";
-        
-        $query = $this->db->query($sql);
-        
-        // JIT Sync if table is entirely empty
-        if (!$query->num_rows && empty($search)) {
-            $this->sync_regional_tables_jit('cities');
-            $query = $this->db->query($sql);
-        }
-        
-        $this->response->setOutput(json_encode(array('results' => $query->rows)));
-    }
-
-    // 5. Search Subdistrict endpoint (aligns with RajaOngkir search_subdistrict)
-    public function search_subdistrict() {
-        $this->response->addHeader('Content-Type: application/json');
-        $search = isset($this->request->get['search']) ? trim($this->request->get['search']) : (isset($this->request->get['q']) ? trim($this->request->get['q']) : '');
         $city_id = isset($this->request->get['city_id']) ? (int)$this->request->get['city_id'] : 0;
         
-        if (!$city_id && !empty($search)) {
-            // Find city ID first if name is provided instead of ID
-            $city_search = $this->db->query("SELECT city_id FROM " . DB_PREFIX . "komerce_city WHERE LOWER(city_name) LIKE '%" . $this->db->escape(strtolower($search)) . "%' LIMIT 1");
-            if ($city_search->num_rows) {
-                $city_id = (int)$city_search->row['city_id'];
+        $query = $this->db->query("SELECT subdistrict_id, subdistrict_name FROM " . DB_PREFIX . "komerce_subdistrict WHERE city_id = '" . (int)$city_id . "' ORDER BY subdistrict_name ASC");
+        
+        if (!$query->num_rows && $city_id) {
+            $result = $this->call_api('destination/subdistrict', array('city' => $city_id));
+            if (!empty($result['rajaongkir']['results'])) {
+                foreach ($result['rajaongkir']['results'] as $sub) {
+                    $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_subdistrict SET subdistrict_id = '" . (int)$sub['subdistrict_id'] . "', city_id = '" . (int)$city_id . "', subdistrict_name = '" . $this->db->escape($sub['subdistrict_name']) . "'");
+                }
+                $query = $this->db->query("SELECT subdistrict_id, subdistrict_name FROM " . DB_PREFIX . "komerce_subdistrict WHERE city_id = '" . (int)$city_id . "' ORDER BY subdistrict_name ASC");
             }
         }
-        
-        $table_check = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_subdistrict'");
-        if (!$table_check->num_rows) {
-            $this->response->setOutput(json_encode(array('results' => array())));
-            return;
-        }
-        
-        // JIT sync subdistricts for this city if we have city_id and local is empty
-        if ($city_id) {
-            $check_sub = $this->db->query("SELECT subdistrict_id FROM " . DB_PREFIX . "komerce_subdistrict WHERE city_id = '" . (int)$city_id . "' LIMIT 1");
-            if (!$check_sub->num_rows) {
-                $this->sync_subdistricts_jit_for_city($city_id);
-            }
-        }
-        
-        $sql = "SELECT subdistrict_id as id, subdistrict_name as text FROM " . DB_PREFIX . "komerce_subdistrict WHERE 1=1";
-        if ($city_id) {
-            $sql .= " AND city_id = '" . (int)$city_id . "'";
-        }
-        if (!empty($search)) {
-            $sql .= " AND LOWER(subdistrict_name) LIKE '%" . $this->db->escape(strtolower($search)) . "%'";
-        }
-        $sql .= " ORDER BY subdistrict_name ASC LIMIT 30";
-        
+        $this->response->setOutput(json_encode($query->rows));
+    }
+
+    // --- SEARCH METHODS (RajaOngkir Format) ---
+    public function search_city() {
+        $this->response->addHeader('Content-Type: application/json');
+        $search = isset($this->request->get['search']) ? $this->request->get['search'] : '';
+        $province_id = isset($this->request->get['province_id']) ? (int)$this->request->get['province_id'] : 0;
+
+        $sql = "SELECT city_id as id, CONCAT(type, ' ', city_name) as text FROM " . DB_PREFIX . "komerce_city WHERE 1=1";
+        if ($province_id) $sql .= " AND province_id = '" . (int)$province_id . "'";
+        if ($search) $sql .= " AND city_name LIKE '%" . $this->db->escape($search) . "%'";
+        $sql .= " ORDER BY city_name ASC LIMIT 20";
+
         $query = $this->db->query($sql);
         $this->response->setOutput(json_encode(array('results' => $query->rows)));
     }
 
-    // 6. Existing method to fetch subdistricts for Journal3 / Checkout AJAX dropdowns
-    public function get_subdistricts_ajax() {
-        $city_input = isset($this->request->get['city_id']) ? trim($this->request->get['city_id']) : '';
-        if (empty($city_input)) {
-            $this->response->addHeader('Content-Type: application/json');
-            $this->response->setOutput(json_encode(array('data' => array())));
+    // --- SYNC METHOD ---
+    public function sync_db() {
+        $this->response->addHeader('Content-Type: application/json');
+        if (!$this->user->hasPermission('modify', 'extension/shipping/komerce_shipping')) {
+            $this->response->setOutput(json_encode(array('success' => false, 'message' => 'No permission')));
             return;
         }
-        
-        $apikey = $this->config->get('komerce_shipping_apikey');
-        if (empty($apikey)) {
-            $apikey = $this->config->get('komerce_apikey');
-        }
-        if (empty($apikey)) {
-            $apikey = 'sNMFcxAQcd0036ae75d0c302FdO0zoLX';
-        }
-        $client_id = $this->config->get('komerce_client_id');
-        if (empty($client_id)) {
-            $client_id = 'CLIENT-ZORAYA-098';
-        }
-        $environment = $this->config->get('komerce_environment');
-        if (empty($environment)) {
-            $environment = 'production';
-        }
-        
-        $city_id = 0;
-        if (is_numeric($city_input)) {
-            $city_id = (int)$city_input;
-        } else {
-            // It's a text name city (standard OpenCart/Journal3 behavior). Search locally first
-            $query = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_city'");
-            if ($query->num_rows) {
-                $db_city = $this->db->query("SELECT city_id FROM " . DB_PREFIX . "komerce_city WHERE LOWER(city_name) LIKE '%" . $this->db->escape(strtolower($city_input)) . "%' LIMIT 1");
-                if ($db_city->num_rows) {
-                    $city_id = (int)$db_city->row['city_id'];
-                }
-            }
-            
-            // Fallback: search live via Komerce cities list
-            if (!$city_id && !empty($apikey) && !empty($client_id)) {
-                $cities_url = ($environment == 'sandbox') 
-                    ? "https://sandbox-api.komerce.id/v2/regional/cities" 
-                    : "https://api.komerce.id/v2/regional/cities";
-                
-                $ch = curl_init($cities_url);
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-                    'X-Komerce-Client-Id: ' . $client_id,
-                    'Authorization: Bearer ' . $apikey
-                ));
-                $cities_resp = curl_exec($ch);
-                curl_close($ch);
-                
-                if ($cities_resp) {
-                    $cities_arr = json_decode($cities_resp, true);
-                    if (!empty($cities_arr['data'])) {
-                        foreach ($cities_arr['data'] as $c) {
-                            if (stripos($c['city_name'], $city_input) !== false || stripos($city_input, $c['city_name']) !== false) {
-                                $city_id = (int)$c['city_id'];
-                                break;
-                            }
-                        }
-                    }
-                }
+
+        $this->install(); // Pastikan tabel ada
+
+        // Sync Provinces
+        $prov_res = $this->call_api('destination/province');
+        if (!empty($prov_res['rajaongkir']['results'])) {
+            foreach ($prov_res['rajaongkir']['results'] as $prov) {
+                $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_province SET province_id = '" . (int)$prov['province_id'] . "', province_name = '" . $this->db->escape($prov['province']) . "'");
             }
         }
 
-        if (!$city_id) {
-            $city_id = 401; // Fallback to Yogyakarta
-        }
-
-        // Try local database query first
-        $table_check = $this->db->query("SHOW TABLES LIKE '" . DB_PREFIX . "komerce_subdistrict'");
-        if ($table_check->num_rows) {
-            $sub_query = $this->db->query("SELECT subdistrict_id, subdistrict_name FROM " . DB_PREFIX . "komerce_subdistrict WHERE city_id = '" . (int)$city_id . "' ORDER BY subdistrict_name ASC");
-            if ($sub_query->num_rows) {
-                $this->response->addHeader('Content-Type: application/json');
-                $this->response->setOutput(json_encode(array('data' => $sub_query->rows)));
-                return;
+        // Sync Cities
+        $city_res = $this->call_api('destination/city');
+        if (!empty($city_res['rajaongkir']['results'])) {
+            foreach ($city_res['rajaongkir']['results'] as $city) {
+                $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_city SET city_id = '" . (int)$city['city_id'] . "', province_id = '" . (int)$city['province_id'] . "', city_name = '" . $this->db->escape($city['city_name']) . "', type = '" . $this->db->escape($city['type']) . "', postal_code = '" . $this->db->escape($city['postal_code']) . "'");
             }
         }
 
-        // Fallback to live Komerce API if local query didn't return rows (JIT caching)
-        if (!empty($apikey) && !empty($client_id)) {
-            $api_url = ($environment == 'sandbox') 
-                ? "https://sandbox-api.komerce.id/v2/regional/subdistricts?city_id=" . $city_id 
-                : "https://api.komerce.id/v2/regional/subdistricts?city_id=" . $city_id;
-
-            $ch = curl_init($api_url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-                'X-Komerce-Client-Id: ' . $client_id,
-                'Authorization: Bearer ' . $apikey
-            ));
-            $response = curl_exec($ch);
-            curl_close($ch);
-
-            if ($response) {
-                $sub_data = json_decode($response, true);
-                if (!empty($sub_data['data'])) {
-                    // Populate local database table
-                    if ($table_check->num_rows) {
-                        foreach ($sub_data['data'] as $sub) {
-                            $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_subdistrict SET subdistrict_id = '" . (int)$sub['subdistrict_id'] . "', city_id = '" . (int)$city_id . "', subdistrict_name = '" . $this->db->escape($sub['subdistrict_name']) . "'");
-                        }
-                    }
-                    
-                    $this->response->addHeader('Content-Type: application/json');
-                    $this->response->setOutput($response);
-                    return;
-                }
-            }
-        }
-
-        $this->response->addHeader('Content-Type: application/json');
-        $this->response->setOutput(json_encode(array('data' => array())));
+        $this->response->setOutput(json_encode(array('success' => true, 'message' => 'Regional data synced successfully!')));
     }
 
-    // Helper: JIT sync of provinces and cities
-    private function sync_regional_tables_jit($type) {
-        $apikey = $this->config->get('komerce_shipping_apikey');
-        if (empty($apikey)) {
-            $apikey = $this->config->get('komerce_apikey');
-        }
-        if (empty($apikey)) {
-            $apikey = 'sNMFcxAQcd0036ae75d0c302FdO0zoLX';
-        }
-        $client_id = $this->config->get('komerce_client_id');
-        if (empty($client_id)) {
-            $client_id = 'CLIENT-ZORAYA-098';
-        }
-        $environment = $this->config->get('komerce_environment');
-        if (empty($environment)) {
-            $environment = 'production';
-        }
-
-        if (empty($apikey) || empty($client_id)) return;
-
-        if ($type === 'provinces') {
-            $url = ($environment == 'sandbox') 
-                ? "https://sandbox-api.komerce.id/v2/regional/provinces" 
-                : "https://api.komerce.id/v2/regional/provinces";
-            $ch = curl_init($url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-                'X-Komerce-Client-Id: ' . $client_id,
-                'Authorization: Bearer ' . $apikey
-            ));
-            $resp = curl_exec($ch);
-            curl_close($ch);
-            if ($resp) {
-                $data = json_decode($resp, true);
-                if (!empty($data['data'])) {
-                    $this->db->query("CREATE TABLE IF NOT EXISTS " . DB_PREFIX . "komerce_province (province_id INT NOT NULL, province_name VARCHAR(100) NOT NULL, PRIMARY KEY (province_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8;");
-                    foreach ($data['data'] as $prov) {
-                        $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_province SET province_id = '" . (int)$prov['province_id'] . "', province_name = '" . $this->db->escape($prov['province_name']) . "'");
-                    }
-                }
-            }
-        } elseif ($type === 'cities') {
-            $url = ($environment == 'sandbox') 
-                ? "https://sandbox-api.komerce.id/v2/regional/cities" 
-                : "https://api.komerce.id/v2/regional/cities";
-            $ch = curl_init($url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-                'X-Komerce-Client-Id: ' . $client_id,
-                'Authorization: Bearer ' . $apikey
-            ));
-            $resp = curl_exec($ch);
-            curl_close($ch);
-            if ($resp) {
-                $data = json_decode($resp, true);
-                if (!empty($data['data'])) {
-                    $this->db->query("CREATE TABLE IF NOT EXISTS " . DB_PREFIX . "komerce_city (city_id INT NOT NULL, province_id INT NOT NULL, city_name VARCHAR(100) NOT NULL, PRIMARY KEY (city_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8;");
-                    foreach ($data['data'] as $city) {
-                        $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_city SET city_id = '" . (int)$city['city_id'] . "', province_id = '" . (int)$city['province_id'] . "', city_name = '" . $this->db->escape($city['city_name']) . "'");
-                    }
-                }
-            }
-        }
+    private function get_name_by_id($type, $id) {
+        if (!$id) return '';
+        $table = DB_PREFIX . "komerce_" . $type;
+        $col_id = $type . "_id";
+        $col_name = $type . "_name";
+        $query = $this->db->query("SELECT $col_name FROM $table WHERE $col_id = '" . (int)$id . "'");
+        return ($query->num_rows) ? $query->row[$col_name] : '';
     }
 
-    // Helper: JIT sync subdistricts for a specific city ID
-    private function sync_subdistricts_jit_for_city($city_id) {
-        $apikey = $this->config->get('komerce_shipping_apikey');
-        if (empty($apikey)) {
-            $apikey = $this->config->get('komerce_apikey');
+    protected function validate() {
+        if (!$this->user->hasPermission('modify', 'extension/shipping/komerce_shipping')) {
+            $this->error['warning'] = "Warning: You do not have permission to modify Komerce shipping!";
         }
-        if (empty($apikey)) {
-            $apikey = 'sNMFcxAQcd0036ae75d0c302FdO0zoLX';
-        }
-        $client_id = $this->config->get('komerce_client_id');
-        if (empty($client_id)) {
-            $client_id = 'CLIENT-ZORAYA-098';
-        }
-        $environment = $this->config->get('komerce_environment');
-        if (empty($environment)) {
-            $environment = 'production';
-        }
-
-        if (empty($apikey) || empty($client_id) || !$city_id) return;
-
-        $url = ($environment == 'sandbox') 
-            ? "https://sandbox-api.komerce.id/v2/regional/subdistricts?city_id=" . (int)$city_id 
-            : "https://api.komerce.id/v2/regional/subdistricts?city_id=" . (int)$city_id;
-
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, array(
-            'X-Komerce-Client-Id: ' . $client_id,
-            'Authorization: Bearer ' . $apikey
-        ));
-        $resp = curl_exec($ch);
-        curl_close($ch);
-
-        if ($resp) {
-            $data = json_decode($resp, true);
-            if (!empty($data['data'])) {
-                $this->db->query("CREATE TABLE IF NOT EXISTS " . DB_PREFIX . "komerce_subdistrict (subdistrict_id INT NOT NULL, city_id INT NOT NULL, subdistrict_name VARCHAR(100) NOT NULL, PRIMARY KEY (subdistrict_id)) ENGINE=InnoDB DEFAULT CHARSET=utf8;");
-                foreach ($data['data'] as $sub) {
-                    $this->db->query("REPLACE INTO " . DB_PREFIX . "komerce_subdistrict SET subdistrict_id = '" . (int)$sub['subdistrict_id'] . "', city_id = '" . (int)$city_id . "', subdistrict_name = '" . $this->db->escape($sub['subdistrict_name']) . "'");
-                }
-            }
-        }
+        return !$this->error;
     }
 }
